@@ -1,0 +1,5 @@
+{
+  "name": "NanoSprite Studio",
+  "description": "A specialized tool to generate, slice, and micro-adjust sprite sheets created with Gemini Nano Banana models, exporting perfectly aligned GIFs.",
+  "requestFramePermissions": []
+}
