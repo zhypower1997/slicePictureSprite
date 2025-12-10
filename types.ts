@@ -8,6 +8,7 @@ export interface FrameConfig {
   height: number;
   offsetX: number;
   offsetY: number;
+  active: boolean;
 }
 
 export interface GridDimensions {

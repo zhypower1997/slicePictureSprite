@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Upload, Sliders, Play, Pause, Download, Wand2, Grid, MousePointer2, AlertCircle } from 'lucide-react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
+import { Upload, Sliders, Play, Pause, Download, Wand2, Grid, MousePointer2, AlertCircle, RefreshCw, Move, Eye, EyeOff, CheckSquare, Square } from 'lucide-react';
 import { FrameConfig, GridDimensions, AppMode } from './types';
 import { generateSpriteSheet } from './services/geminiService';
 import { getGifWorkerUrl } from './utils/gifWorker';
@@ -10,12 +10,30 @@ declare global {
   }
 }
 
+interface Dividers {
+  v: number[]; // Vertical dividers (0 to 1)
+  h: number[]; // Horizontal dividers (0 to 1)
+}
+
+interface SelectionBox {
+    startX: number;
+    startY: number;
+    currentX: number;
+    currentY: number;
+}
+
+const HIT_TOLERANCE = 12; // Pixels distance to grab a line
+
 const App: React.FC = () => {
   const [mode, setMode] = useState<AppMode>(AppMode.EDIT);
   const [sourceImage, setSourceImage] = useState<string | null>(null);
-  const [grid, setGrid] = useState<GridDimensions>({ rows: 1, cols: 1 });
+  const [grid, setGrid] = useState<GridDimensions>({ rows: 3, cols: 3 });
+  const [dividers, setDividers] = useState<Dividers>({ v: [0.33, 0.66], h: [0.33, 0.66] });
+  
   const [frames, setFrames] = useState<FrameConfig[]>([]);
-  const [selectedFrameId, setSelectedFrameId] = useState<number | null>(null);
+  // Changed to array for multiple selection
+  const [selectedFrameIds, setSelectedFrameIds] = useState<number[]>([]); 
+  
   const [fps, setFps] = useState<number>(8);
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
   const [previewFrameIndex, setPreviewFrameIndex] = useState<number>(0);
@@ -23,6 +41,15 @@ const App: React.FC = () => {
   const [prompt, setPrompt] = useState<string>('A cute pixel art robot walking');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [generationSuccess, setGenerationSuccess] = useState<boolean>(false);
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+
+  // Interaction State
+  const [dragTarget, setDragTarget] = useState<{ type: 'v' | 'h', index: number } | null>(null);
+  const [hoverTarget, setHoverTarget] = useState<{ type: 'v' | 'h', index: number } | null>(null);
+  
+  // Selection Box State
+  const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
+  const [isSelecting, setIsSelecting] = useState<boolean>(false);
 
   // References
   const imgRef = useRef<HTMLImageElement>(new Image());
@@ -30,7 +57,18 @@ const App: React.FC = () => {
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Load image when source changes
+  // Derived State
+  // Sort by ID to ensure GIF plays in grid order
+  const activeFrames = useMemo(() => frames.filter(f => f.active).sort((a,b) => a.id - b.id), [frames]);
+
+  // --- Initialization & Grid Logic ---
+
+  const resetDividers = (rows: number, cols: number) => {
+     const v = Array.from({length: cols - 1}, (_, i) => (i + 1) / cols);
+     const h = Array.from({length: rows - 1}, (_, i) => (i + 1) / rows);
+     setDividers({ v, h });
+  };
+
   useEffect(() => {
     if (sourceImage) {
       const img = imgRef.current;
@@ -39,41 +77,91 @@ const App: React.FC = () => {
         calculateFrames();
       };
     }
-  }, [sourceImage, grid]);
+  }, [sourceImage]);
+
+  useEffect(() => {
+      calculateFrames();
+  }, [dividers, sourceImage]);
 
   const calculateFrames = () => {
-    if (!imgRef.current.complete) return;
+    if (!imgRef.current.complete || !imgRef.current.src) return;
     
     const imgWidth = imgRef.current.width;
     const imgHeight = imgRef.current.height;
-    const frameWidth = imgWidth / grid.cols;
-    const frameHeight = imgHeight / grid.rows;
 
-    // If frames already exist, try to preserve offsets if count matches
+    // Construct full list of split points including 0 and 1
+    const xPoints = [0, ...dividers.v, 1].map(p => p * imgWidth);
+    const yPoints = [0, ...dividers.h, 1].map(p => p * imgHeight);
+
     setFrames(prev => {
         const newFrames: FrameConfig[] = [];
         let idCounter = 0;
-        for (let r = 0; r < grid.rows; r++) {
-            for (let c = 0; c < grid.cols; c++) {
-                const existing = prev.find(p => p.id === idCounter);
+        
+        for (let r = 0; r < yPoints.length - 1; r++) {
+            for (let c = 0; c < xPoints.length - 1; c++) {
+                const x = xPoints[c];
+                const y = yPoints[r];
+                const width = xPoints[c+1] - x;
+                const height = yPoints[r+1] - y;
+                
+                // Try to find existing frame to preserve offsets and active state
+                // We map loosely based on row/col index to keep state persistence during resize
+                const existing = prev.find(p => p.row === r && p.col === c);
+                
                 newFrames.push({
                     id: idCounter,
                     row: r,
                     col: c,
-                    x: c * frameWidth,
-                    y: r * frameHeight,
-                    width: frameWidth,
-                    height: frameHeight,
+                    x,
+                    y,
+                    width,
+                    height,
                     offsetX: existing ? existing.offsetX : 0,
                     offsetY: existing ? existing.offsetY : 0,
+                    active: existing ? existing.active : true,
                 });
                 idCounter++;
             }
         }
         return newFrames;
     });
-    setPreviewFrameIndex(0);
+    // Clear selection on re-calc to avoid ghost IDs
+    setSelectedFrameIds([]);
   };
+
+  const handleGridCountChange = (type: 'rows' | 'cols', val: number) => {
+      const newVal = Math.max(1, Math.min(20, val));
+      const newGrid = { ...grid, [type]: newVal };
+      setGrid(newGrid);
+      resetDividers(newGrid.rows, newGrid.cols);
+  };
+
+  // --- Batch Operations ---
+
+  const updateFrameOffset = (axis: 'x' | 'y', delta: number) => {
+      if (selectedFrameIds.length === 0) return;
+      setFrames(prev => prev.map(f => {
+          if (selectedFrameIds.includes(f.id)) {
+              return { 
+                  ...f, 
+                  [axis === 'x' ? 'offsetX' : 'offsetY']: (axis === 'x' ? f.offsetX : f.offsetY) + delta 
+              };
+          }
+          return f;
+      }));
+  };
+
+  const setBatchActive = (active: boolean) => {
+      if (selectedFrameIds.length === 0) return;
+      setFrames(prev => prev.map(f => {
+          if (selectedFrameIds.includes(f.id)) {
+              return { ...f, active };
+          }
+          return f;
+      }));
+  };
+
+  // --- File & GenAI ---
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -83,6 +171,9 @@ const App: React.FC = () => {
         setSourceImage(ev.target?.result as string);
         setMode(AppMode.EDIT);
         setGenerationSuccess(false);
+        // Reset to default grid on new file
+        setGrid({rows: 3, cols: 3});
+        resetDividers(3, 3);
       };
       reader.readAsDataURL(file);
     }
@@ -95,9 +186,9 @@ const App: React.FC = () => {
     try {
       const base64Image = await generateSpriteSheet(prompt);
       setSourceImage(base64Image);
-      // Auto-guess grid for nano banana (often 3x3 or 4x4 for simple sprites)
-      // We start with 3x3 as a safe bet for sprite sheets
+      // Auto-guess grid for nano banana (3x3 is common)
       setGrid({ rows: 3, cols: 3 }); 
+      resetDividers(3, 3);
       setMode(AppMode.EDIT);
       setGenerationSuccess(true);
     } catch (err: any) {
@@ -107,19 +198,113 @@ const App: React.FC = () => {
     }
   };
 
-  // Preview Loop
+  // --- Export ---
+  const handleExportGif = () => {
+      if (!activeFrames.length || !imgRef.current.complete) return;
+      setIsExporting(true);
+
+      // Determine dimensions based on the first active frame (assuming rough uniformity)
+      // or calculate max width/height if grid is irregular
+      const maxWidth = Math.max(...activeFrames.map(f => f.width));
+      const maxHeight = Math.max(...activeFrames.map(f => f.height));
+
+      const gif = new window.GIF({
+          workers: 2,
+          quality: 10,
+          width: maxWidth, 
+          height: maxHeight,
+          workerScript: getGifWorkerUrl(),
+          transparent: 0x000000, 
+      });
+
+      // Create a temporary canvas to draw each frame with its offset
+      const tempCanvas = document.createElement('canvas');
+      const ctx = tempCanvas.getContext('2d');
+
+      activeFrames.forEach(frame => {
+          tempCanvas.width = maxWidth;
+          tempCanvas.height = maxHeight;
+          
+          if (ctx) {
+            ctx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
+            // Center alignment strategy: Draw frame relative to the "standard" box size
+            // but for now, we simply use the frame's own top-left as 0,0 relative to its cut
+            
+            // Note: If frame.width < maxWidth, we might want to center it.
+            // For simple sprite sheets, usually all cells are same size.
+            // We apply the User's manual Offset here.
+            
+            ctx.drawImage(
+                imgRef.current, 
+                frame.x, frame.y, frame.width, frame.height, 
+                frame.offsetX, frame.offsetY, frame.width, frame.height
+            );
+            gif.addFrame(ctx, {copy: true, delay: 1000 / fps});
+          }
+      });
+
+      gif.on('finished', (blob: Blob) => {
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = 'sprite-animation.gif';
+          link.click();
+          setIsExporting(false);
+      });
+
+      gif.render();
+  };
+
+
+  // --- Preview Loop ---
   useEffect(() => {
-    if (!isPlaying || frames.length === 0) return;
+    if (!isPlaying || activeFrames.length === 0) return;
+
+    // Reset index if out of bounds (e.g. frames disabled)
+    if (previewFrameIndex >= activeFrames.length) {
+        setPreviewFrameIndex(0);
+    }
 
     const interval = setInterval(() => {
-      setPreviewFrameIndex(current => (current + 1) % frames.length);
+      setPreviewFrameIndex(current => (current + 1) % activeFrames.length);
     }, 1000 / fps);
 
     return () => clearInterval(interval);
-  }, [isPlaying, fps, frames.length]);
+  }, [isPlaying, fps, activeFrames.length]); // Depend on activeFrames length
 
-  // Render Editor Canvas (Grid & Selection)
-  useEffect(() => {
+  // --- Canvas Rendering ---
+  
+  // Helper to get mouse pos relative to image logic
+  const getRelativeMousePos = (e: React.MouseEvent) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return { x: 0, y: 0 };
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      return {
+          x: (e.clientX - rect.left) * scaleX,
+          y: (e.clientY - rect.top) * scaleY
+      };
+  };
+
+  // Helper to normalize selection box
+  const getSelectionRect = (box: SelectionBox) => {
+      const x = Math.min(box.startX, box.currentX);
+      const y = Math.min(box.startY, box.currentY);
+      const width = Math.abs(box.currentX - box.startX);
+      const height = Math.abs(box.currentY - box.startY);
+      return { x, y, width, height };
+  };
+
+  const isIntersecting = (r1: {x:number, y:number, width:number, height:number}, r2: {x:number, y:number, width:number, height:number}) => {
+      return !(r2.x > r1.x + r1.width || 
+               r2.x + r2.width < r1.x || 
+               r2.y > r1.y + r1.height || 
+               r2.y + r2.height < r1.y);
+  };
+
+  // Main Draw Loop
+  const drawEditor = () => {
     const canvas = canvasRef.current;
     if (!canvas || !sourceImage || !frames.length) return;
     const ctx = canvas.getContext('2d');
@@ -127,428 +312,475 @@ const App: React.FC = () => {
 
     const img = imgRef.current;
     
-    // Resize canvas to match image natural size, but styled via CSS to fit
-    canvas.width = img.width;
-    canvas.height = img.height;
+    // Ensure canvas matches image resolution
+    if (canvas.width !== img.width || canvas.height !== img.height) {
+        canvas.width = img.width;
+        canvas.height = img.height;
+    }
 
-    // Draw Image
+    // 1. Draw Source Image
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0);
 
-    // Draw Grid Lines
-    ctx.strokeStyle = 'rgba(0, 255, 255, 0.5)';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    
-    // Vertical lines
-    for (let i = 1; i < grid.cols; i++) {
-        const x = (img.width / grid.cols) * i;
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, img.height);
-    }
-    // Horizontal lines
-    for (let i = 1; i < grid.rows; i++) {
-        const y = (img.height / grid.rows) * i;
-        ctx.moveTo(0, y);
-        ctx.lineTo(img.width, y);
-    }
-    ctx.stroke();
-
-    // Highlight Selected Frame
-    if (selectedFrameId !== null) {
-        const frame = frames.find(f => f.id === selectedFrameId);
-        if (frame) {
-            ctx.fillStyle = 'rgba(255, 0, 128, 0.3)';
+    // 2. Draw Frame Overlays
+    frames.forEach(frame => {
+        // Handle Inactive Frames
+        if (!frame.active) {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.65)'; // Dark overlay
             ctx.fillRect(frame.x, frame.y, frame.width, frame.height);
-            ctx.strokeStyle = '#ff0080';
-            ctx.lineWidth = 3;
+            
+            // Draw 'X'
+            ctx.beginPath();
+            ctx.moveTo(frame.x, frame.y);
+            ctx.lineTo(frame.x + frame.width, frame.y + frame.height);
+            ctx.moveTo(frame.x + frame.width, frame.y);
+            ctx.lineTo(frame.x, frame.y + frame.height);
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+
+        // Highlight selected frames
+        if (selectedFrameIds.includes(frame.id)) {
+            ctx.fillStyle = 'rgba(59, 130, 246, 0.2)'; // Blue tint
+            ctx.fillRect(frame.x, frame.y, frame.width, frame.height);
+            ctx.strokeStyle = '#3b82f6';
+            ctx.lineWidth = 2;
             ctx.strokeRect(frame.x, frame.y, frame.width, frame.height);
             
-            // Draw Indicator for Offset if exists
+            // Draw Offset Indicator
             if (frame.offsetX !== 0 || frame.offsetY !== 0) {
-               ctx.beginPath();
-               ctx.strokeStyle = 'yellow';
-               ctx.moveTo(frame.x + frame.width/2, frame.y + frame.height/2);
-               ctx.lineTo(frame.x + frame.width/2 + frame.offsetX, frame.y + frame.height/2 + frame.offsetY);
-               ctx.stroke();
-               ctx.fillStyle = 'yellow';
-               ctx.beginPath();
-               ctx.arc(frame.x + frame.width/2 + frame.offsetX, frame.y + frame.height/2 + frame.offsetY, 3, 0, Math.PI*2);
-               ctx.fill();
+                 ctx.save();
+                 ctx.strokeStyle = 'rgba(255, 0, 0, 0.6)';
+                 ctx.setLineDash([4, 4]);
+                 ctx.strokeRect(frame.x + frame.offsetX, frame.y + frame.offsetY, frame.width, frame.height);
+                 ctx.restore();
             }
         }
+    });
+
+    // 3. Draw Draggable Grid Lines
+    // Vertical
+    dividers.v.forEach((pos, idx) => {
+        const x = pos * canvas.width;
+        const isHovered = hoverTarget?.type === 'v' && hoverTarget.index === idx;
+        const isDragging = dragTarget?.type === 'v' && dragTarget.index === idx;
+
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.lineWidth = isHovered || isDragging ? 3 : 1;
+        ctx.strokeStyle = isHovered || isDragging ? '#ef4444' : 'rgba(0, 255, 255, 0.7)';
+        ctx.stroke();
+    });
+
+    // Horizontal
+    dividers.h.forEach((pos, idx) => {
+        const y = pos * canvas.height;
+        const isHovered = hoverTarget?.type === 'h' && hoverTarget.index === idx;
+        const isDragging = dragTarget?.type === 'h' && dragTarget.index === idx;
+
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.lineWidth = isHovered || isDragging ? 3 : 1;
+        ctx.strokeStyle = isHovered || isDragging ? '#ef4444' : 'rgba(0, 255, 255, 0.7)';
+        ctx.stroke();
+    });
+
+    // 4. Draw Selection Box
+    if (selectionBox) {
+        const rect = getSelectionRect(selectionBox);
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.2)';
+        ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+        ctx.strokeStyle = 'rgba(59, 130, 246, 0.8)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
     }
+  };
 
-  }, [sourceImage, grid, frames, selectedFrameId]);
-
-  // Render Preview Canvas
   useEffect(() => {
-    const canvas = previewCanvasRef.current;
-    if (!canvas || frames.length === 0) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+     requestAnimationFrame(drawEditor);
+  }, [sourceImage, frames, dividers, hoverTarget, dragTarget, selectedFrameIds, selectionBox]);
 
-    const currentFrame = frames[previewFrameIndex];
-    if (!currentFrame) return;
 
-    const img = imgRef.current;
-    
-    // Set canvas size to frame size
-    // We maintain the aspect ratio of the frame
-    canvas.width = currentFrame.width;
-    canvas.height = currentFrame.height;
+  // --- Canvas Interaction ---
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    
-    // Draw the specific slice with offsets
-    // source x, source y, source w, source h, dest x, dest y, dest w, dest h
-    ctx.drawImage(
-        img,
-        currentFrame.x,
-        currentFrame.y,
-        currentFrame.width,
-        currentFrame.height,
-        -currentFrame.offsetX, // Apply offset inversely to "move" the character
-        -currentFrame.offsetY,
-        currentFrame.width,
-        currentFrame.height
-    );
+  const handleMouseDown = (e: React.MouseEvent) => {
+      const { x, y } = getRelativeMousePos(e);
 
-  }, [previewFrameIndex, frames]);
+      // 1. Grid Line Priority
+      if (hoverTarget) {
+          setDragTarget(hoverTarget);
+          return;
+      }
 
-  // Click on Canvas to Select Frame
-  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+      // 2. Start Selection Box
+      setIsSelecting(true);
+      setSelectionBox({
+          startX: x,
+          startY: y,
+          currentX: x,
+          currentY: y
+      });
+      
+      // Clear selection unless holding Shift (can add shift logic later, keep simple for now)
+      // Actually, standard behavior: Click clears, Drag creates new selection. 
+      // We will handle "click vs drag" logic in MouseUp.
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+      const { x, y } = getRelativeMousePos(e);
       const canvas = canvasRef.current;
       if (!canvas) return;
-      
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      
-      const x = (e.clientX - rect.left) * scaleX;
-      const y = (e.clientY - rect.top) * scaleY;
 
-      const clickedFrame = frames.find(f => 
-          x >= f.x && x < f.x + f.width &&
-          y >= f.y && y < f.y + f.height
-      );
+      if (dragTarget) {
+          // DRAGGING GRID LINE
+          if (dragTarget.type === 'v') {
+              const prevLimit = dragTarget.index === 0 ? 0 : dividers.v[dragTarget.index - 1];
+              const nextLimit = dragTarget.index === dividers.v.length - 1 ? 1 : dividers.v[dragTarget.index + 1];
+              
+              // Clamp to normalized coordinates
+              let newPos = x / canvas.width;
+              newPos = Math.max(prevLimit + 0.01, Math.min(nextLimit - 0.01, newPos));
+              
+              const newV = [...dividers.v];
+              newV[dragTarget.index] = newPos;
+              setDividers({ ...dividers, v: newV });
+          } else {
+              const prevLimit = dragTarget.index === 0 ? 0 : dividers.h[dragTarget.index - 1];
+              const nextLimit = dragTarget.index === dividers.h.length - 1 ? 1 : dividers.h[dragTarget.index + 1];
+              
+              let newPos = y / canvas.height;
+              newPos = Math.max(prevLimit + 0.01, Math.min(nextLimit - 0.01, newPos));
+              
+              const newH = [...dividers.h];
+              newH[dragTarget.index] = newPos;
+              setDividers({ ...dividers, h: newH });
+          }
+          return;
+      }
 
-      if (clickedFrame) {
-          setSelectedFrameId(clickedFrame.id);
-          // Set preview to this frame so user can see what they are editing
-          setPreviewFrameIndex(clickedFrame.id);
-          setIsPlaying(false); // Pause to edit
+      if (isSelecting && selectionBox) {
+          // DRAGGING SELECTION BOX
+          setSelectionBox(prev => prev ? ({ ...prev, currentX: x, currentY: y }) : null);
+          return;
+      }
+
+      // HOVER DETECTION FOR GRID
+      let found: { type: 'v' | 'h', index: number } | null = null;
+      
+      // Check Vertical Lines
+      for (let i = 0; i < dividers.v.length; i++) {
+          const lineX = dividers.v[i] * canvas.width;
+          if (Math.abs(x - lineX) < HIT_TOLERANCE) {
+              found = { type: 'v', index: i };
+              break;
+          }
+      }
+
+      // Check Horizontal Lines (prioritize if not found vertical)
+      if (!found) {
+          for (let i = 0; i < dividers.h.length; i++) {
+              const lineY = dividers.h[i] * canvas.height;
+              if (Math.abs(y - lineY) < HIT_TOLERANCE) {
+                  found = { type: 'h', index: i };
+                  break;
+              }
+          }
+      }
+
+      setHoverTarget(found);
+  };
+
+  const handleMouseUp = (e: React.MouseEvent) => {
+      // End Drag
+      if (dragTarget) {
+          setDragTarget(null);
+          return;
+      }
+
+      // End Selection
+      if (isSelecting && selectionBox) {
+          const { x, y } = getRelativeMousePos(e);
+          const dist = Math.sqrt(Math.pow(x - selectionBox.startX, 2) + Math.pow(y - selectionBox.startY, 2));
+
+          if (dist < 5) {
+              // CLICK: Select single frame
+              const clickedFrame = frames.find(f => 
+                x >= f.x && x < f.x + f.width && 
+                y >= f.y && y < f.y + f.height
+              );
+              if (clickedFrame) {
+                  setSelectedFrameIds([clickedFrame.id]);
+              } else {
+                  setSelectedFrameIds([]);
+              }
+          } else {
+              // DRAG: Box select
+              const selRect = getSelectionRect(selectionBox);
+              const intersected = frames.filter(f => isIntersecting(selRect, f));
+              setSelectedFrameIds(intersected.map(f => f.id));
+          }
+          
+          setSelectionBox(null);
+          setIsSelecting(false);
       }
   };
 
-  const updateFrameOffset = useCallback((dx: number, dy: number) => {
-      if (selectedFrameId === null) return;
-      setFrames(prev => prev.map(f => {
-          if (f.id === selectedFrameId) {
-              return { ...f, offsetX: f.offsetX + dx, offsetY: f.offsetY + dy };
-          }
-          return f;
-      }));
-  }, [selectedFrameId]);
-
-  // Keyboard Shortcuts for Nudging
-  useEffect(() => {
-      const handleKeyDown = (e: KeyboardEvent) => {
-          if (selectedFrameId === null) return;
-          
-          if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
-             e.preventDefault(); 
-          }
-
-          if (e.key === 'ArrowUp') updateFrameOffset(0, -1);
-          if (e.key === 'ArrowDown') updateFrameOffset(0, 1);
-          if (e.key === 'ArrowLeft') updateFrameOffset(-1, 0);
-          if (e.key === 'ArrowRight') updateFrameOffset(1, 0);
-      };
-
-      window.addEventListener('keydown', handleKeyDown);
-      return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedFrameId, updateFrameOffset]);
-
-  const handleDownloadGif = () => {
-      if (!frames.length || !imgRef.current) return;
-      
-      const workerUrl = getGifWorkerUrl();
-
-      const gif = new window.GIF({
-        workers: 2,
-        quality: 10,
-        width: frames[0].width,
-        height: frames[0].height,
-        workerScript: workerUrl
-      });
-
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = frames[0].width;
-      tempCanvas.height = frames[0].height;
-      const ctx = tempCanvas.getContext('2d');
-      if (!ctx) return;
-
-      frames.forEach(frame => {
-          ctx.clearRect(0,0, tempCanvas.width, tempCanvas.height);
-          // Background color for GIF? Let's keep it transparent if possible
-          // or fill with a color if user wants, but default transparent is standard
-          
-          ctx.drawImage(
-            imgRef.current,
-            frame.x, frame.y, frame.width, frame.height,
-            -frame.offsetX, -frame.offsetY, frame.width, frame.height
-          );
-          
-          gif.addFrame(ctx, {copy: true, delay: 1000/fps});
-      });
-
-      gif.on('finished', (blob: Blob) => {
-          window.open(URL.createObjectURL(blob));
-          URL.revokeObjectURL(workerUrl); // Clean up
-      });
-
-      gif.render();
+  const handleMouseLeave = () => {
+      setDragTarget(null);
+      setHoverTarget(null);
+      setSelectionBox(null);
+      setIsSelecting(false);
   };
 
-  return (
-    <div className="flex h-screen w-full bg-zinc-950 text-zinc-100 overflow-hidden font-sans">
+  // Cursor style
+  const getCursor = () => {
+      if (dragTarget) return dragTarget.type === 'v' ? 'col-resize' : 'row-resize';
+      if (hoverTarget) return hoverTarget.type === 'v' ? 'col-resize' : 'row-resize';
+      if (isSelecting) return 'crosshair';
+      return 'default';
+  };
+
+  // --- Preview Renderer ---
+  useEffect(() => {
+      if (!previewCanvasRef.current) return;
+      const ctx = previewCanvasRef.current.getContext('2d');
+      if (!ctx) return;
+
+      // Handle case with no active frames
+      if (activeFrames.length === 0) {
+          ctx.clearRect(0, 0, previewCanvasRef.current.width, previewCanvasRef.current.height);
+          ctx.fillStyle = '#18181b';
+          ctx.fillRect(0, 0, previewCanvasRef.current.width, previewCanvasRef.current.height);
+          return;
+      }
+
+      const safeIndex = previewFrameIndex % activeFrames.length;
+      const frame = activeFrames[safeIndex];
       
-      {/* Sidebar Controls */}
-      <aside className="w-80 border-r border-zinc-800 p-6 flex flex-col gap-6 overflow-y-auto bg-zinc-900/50 backdrop-blur-sm">
-        <div className="flex items-center gap-2 mb-2">
-            <div className="w-8 h-8 rounded bg-gradient-to-tr from-pink-500 to-violet-500 flex items-center justify-center font-bold">N</div>
-            <h1 className="text-xl font-bold tracking-tight">NanoSprite</h1>
+      if (imgRef.current.complete && frame) {
+          // Set canvas size to frame size
+          previewCanvasRef.current.width = frame.width;
+          previewCanvasRef.current.height = frame.height;
+
+          ctx.clearRect(0, 0, frame.width, frame.height);
+          ctx.drawImage(
+              imgRef.current, 
+              frame.x, frame.y, frame.width, frame.height, 
+              frame.offsetX, frame.offsetY, frame.width, frame.height
+          );
+      }
+
+  }, [previewFrameIndex, activeFrames]); // Redraw when index or geometry changes
+
+
+  return (
+    <div className="flex h-screen w-full bg-zinc-950 text-zinc-200 font-sans overflow-hidden">
+      
+      {/* LEFT SIDEBAR - Controls */}
+      <aside className="w-80 flex-shrink-0 border-r border-zinc-800 bg-zinc-900/50 p-4 flex flex-col gap-6 overflow-y-auto">
+        
+        {/* Header */}
+        <div>
+          <h1 className="text-xl font-bold flex items-center gap-2 text-indigo-400">
+            <Wand2 className="w-5 h-5" />
+            NanoSprite
+          </h1>
+          <p className="text-xs text-zinc-500 mt-1">AI Sprite Sheet Slicer</p>
         </div>
 
-        {/* Mode Switcher */}
-        <div className="flex p-1 bg-zinc-800 rounded-lg">
-            <button 
-                onClick={() => setMode(AppMode.GENERATE)}
-                className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-all ${mode === AppMode.GENERATE ? 'bg-zinc-600 text-white shadow' : 'text-zinc-400 hover:text-zinc-200'}`}
-            >
-                Generate
-            </button>
-            <button 
-                onClick={() => setMode(AppMode.EDIT)}
-                className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-all ${mode === AppMode.EDIT ? 'bg-zinc-600 text-white shadow' : 'text-zinc-400 hover:text-zinc-200'}`}
-            >
-                Edit
-            </button>
+        {/* Generator Section */}
+        <div className="space-y-3">
+          <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Generate New</label>
+          <textarea 
+            className="w-full bg-zinc-950 border border-zinc-700 rounded p-3 text-sm focus:border-indigo-500 focus:outline-none resize-none h-24"
+            placeholder="Describe your character (e.g., 'a small knight running animation')"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+          />
+          <button 
+            onClick={handleGenerate}
+            disabled={isGenerating}
+            className="w-full py-2 bg-indigo-600 hover:bg-indigo-500 rounded text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 transition-colors"
+          >
+            {isGenerating ? <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"/> : <Wand2 className="w-4 h-4" />}
+            Generate Sprite
+          </button>
+          {errorMsg && (
+            <div className="p-2 bg-red-900/20 border border-red-800 rounded text-xs text-red-300 flex items-center gap-2">
+              <AlertCircle className="w-3 h-3" />
+              {errorMsg}
+            </div>
+          )}
         </div>
 
-        {mode === AppMode.GENERATE && (
-             <div className="space-y-4 animate-in slide-in-from-left-4 fade-in duration-300">
-                <div className="space-y-2">
-                    <label className="text-xs font-semibold text-zinc-400 uppercase">Prompt</label>
-                    <textarea 
-                        className="w-full bg-zinc-800 border border-zinc-700 rounded-md p-3 text-sm focus:ring-2 focus:ring-pink-500 outline-none resize-none h-32"
-                        placeholder="E.g., A running pixel art cat, side view"
-                        value={prompt}
-                        onChange={(e) => setPrompt(e.target.value)}
+        <div className="h-px bg-zinc-800" />
+
+        {/* Upload */}
+        <div className="space-y-3">
+          <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Or Upload Source</label>
+          <label className="flex flex-col items-center justify-center w-full h-16 border-2 border-zinc-700 border-dashed rounded cursor-pointer hover:border-zinc-500 transition-colors bg-zinc-900">
+             <div className="flex flex-col items-center justify-center pt-2 pb-2">
+                <Upload className="w-5 h-5 text-zinc-400 mb-1" />
+                <p className="text-xs text-zinc-500">Upload PNG/JPG</p>
+             </div>
+             <input type="file" className="hidden" accept="image/*" onChange={handleFileUpload} />
+          </label>
+        </div>
+
+        <div className="h-px bg-zinc-800" />
+
+        {/* Slicing Controls */}
+        <div className="space-y-4">
+            <div className="flex items-center justify-between">
+                <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500 flex items-center gap-2">
+                    <Grid className="w-3 h-3" /> Grid Layout
+                </label>
+                <button onClick={() => resetDividers(grid.rows, grid.cols)} className="text-[10px] text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
+                    <RefreshCw className="w-3 h-3" /> Reset
+                </button>
+            </div>
+            
+            <div className="grid grid-cols-2 gap-3">
+                <div>
+                    <span className="text-xs text-zinc-400 block mb-1">Rows</span>
+                    <input 
+                        type="number" 
+                        min="1" max="16"
+                        value={grid.rows}
+                        onChange={(e) => handleGridCountChange('rows', parseInt(e.target.value) || 1)}
+                        className="w-full bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-sm"
                     />
                 </div>
-                <button 
-                    onClick={handleGenerate}
-                    disabled={isGenerating}
-                    className="w-full py-2 bg-pink-600 hover:bg-pink-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-md font-medium transition-colors flex items-center justify-center gap-2"
-                >
-                    {isGenerating ? <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"/> : <Wand2 size={16} />}
-                    {isGenerating ? 'Dreaming...' : 'Generate Sprite'}
-                </button>
-                {errorMsg && (
-                    <div className="p-3 bg-red-900/30 border border-red-800 rounded text-red-200 text-xs flex gap-2">
-                        <AlertCircle size={14} className="mt-0.5" />
-                        {errorMsg}
-                    </div>
-                )}
+                <div>
+                    <span className="text-xs text-zinc-400 block mb-1">Columns</span>
+                    <input 
+                        type="number" 
+                        min="1" max="16"
+                        value={grid.cols}
+                        onChange={(e) => handleGridCountChange('cols', parseInt(e.target.value) || 1)}
+                        className="w-full bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-sm"
+                    />
+                </div>
             </div>
-        )}
+            <p className="text-[10px] text-zinc-500 italic">
+                Tip: Drag grid lines to adjust. Drag empty space to box-select.
+            </p>
+        </div>
 
-        {mode === AppMode.EDIT && (
-            <div className="space-y-6 animate-in slide-in-from-left-4 fade-in duration-300">
-                <div className="space-y-2">
-                    <label className="text-xs font-semibold text-zinc-400 uppercase">Input Source</label>
-                    <label className="flex flex-col items-center justify-center w-full h-24 border-2 border-dashed border-zinc-700 rounded-lg cursor-pointer hover:border-zinc-500 hover:bg-zinc-800/50 transition-colors">
-                        <div className="flex flex-col items-center justify-center pt-5 pb-6">
-                            <Upload className="w-6 h-6 mb-2 text-zinc-400" />
-                            <p className="text-xs text-zinc-500">Click to upload image</p>
-                        </div>
-                        <input type="file" className="hidden" accept="image/*" onChange={handleFileUpload} />
-                    </label>
+        {/* Selected Frames Adjustment */}
+        {selectedFrameIds.length > 0 && (
+            <div className="bg-zinc-800/40 rounded p-3 space-y-3 border border-zinc-700/50">
+                <div className="flex items-center justify-between border-b border-zinc-700/50 pb-2">
+                     <span className="text-xs font-medium text-white flex items-center gap-1">
+                        <Move className="w-3 h-3" /> {selectedFrameIds.length} Frame{selectedFrameIds.length > 1 ? 's' : ''} Selected
+                     </span>
+                </div>
+                
+                {/* Batch Actions */}
+                <div className="grid grid-cols-2 gap-2">
+                    <button 
+                        onClick={() => setBatchActive(true)}
+                        className="flex items-center justify-center gap-1 bg-green-900/30 hover:bg-green-900/50 text-green-400 border border-green-800/50 rounded py-1.5 text-xs transition-colors"
+                    >
+                        <CheckSquare className="w-3 h-3" /> Mark Active
+                    </button>
+                    <button 
+                         onClick={() => setBatchActive(false)}
+                         className="flex items-center justify-center gap-1 bg-red-900/30 hover:bg-red-900/50 text-red-400 border border-red-800/50 rounded py-1.5 text-xs transition-colors"
+                    >
+                        <Square className="w-3 h-3" /> Mark Skipped
+                    </button>
                 </div>
 
-                {sourceImage && (
-                    <>
-                        <div className="space-y-3">
-                            <div className="flex items-center justify-between">
-                                <label className="text-xs font-semibold text-zinc-400 uppercase flex items-center gap-1">
-                                    <Grid size={12} /> Grid Layout
-                                </label>
-                            </div>
-                            <div className="grid grid-cols-2 gap-3">
-                                <div>
-                                    <span className="text-xs text-zinc-500 mb-1 block">Rows</span>
-                                    <input 
-                                        type="number" 
-                                        min="1" max="10" 
-                                        value={grid.rows}
-                                        onChange={(e) => setGrid(prev => ({ ...prev, rows: parseInt(e.target.value) || 1 }))}
-                                        className="w-full bg-zinc-800 border border-zinc-700 rounded p-1.5 text-sm text-center"
-                                    />
-                                </div>
-                                <div>
-                                    <span className="text-xs text-zinc-500 mb-1 block">Cols</span>
-                                    <input 
-                                        type="number" 
-                                        min="1" max="10" 
-                                        value={grid.cols}
-                                        onChange={(e) => setGrid(prev => ({ ...prev, cols: parseInt(e.target.value) || 1 }))}
-                                        className="w-full bg-zinc-800 border border-zinc-700 rounded p-1.5 text-sm text-center"
-                                    />
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="space-y-3">
-                             <label className="text-xs font-semibold text-zinc-400 uppercase flex items-center gap-1">
-                                <MousePointer2 size={12} /> Micro Adjust
-                            </label>
-                             <div className="bg-zinc-900 rounded p-3 border border-zinc-800 text-xs text-zinc-400">
-                                {selectedFrameId !== null ? (
-                                    <div className="space-y-2">
-                                        <div className="flex justify-between">
-                                            <span>Frame:</span>
-                                            <span className="text-white font-mono">{selectedFrameId + 1}</span>
-                                        </div>
-                                        <div className="flex justify-between">
-                                            <span>Offset X:</span>
-                                            <span className="text-white font-mono">{frames.find(f => f.id === selectedFrameId)?.offsetX}px</span>
-                                        </div>
-                                        <div className="flex justify-between">
-                                            <span>Offset Y:</span>
-                                            <span className="text-white font-mono">{frames.find(f => f.id === selectedFrameId)?.offsetY}px</span>
-                                        </div>
-                                        <div className="pt-2 text-[10px] text-zinc-600 text-center">
-                                            Use Arrow Keys to nudge
-                                        </div>
-                                    </div>
-                                ) : (
-                                    <div className="text-center py-2">
-                                        Click a grid cell on the image to select and adjust it.
-                                    </div>
-                                )}
-                             </div>
-                        </div>
-                    </>
-                )}
+                <div className="space-y-2">
+                    <div className="text-[10px] text-zinc-500 uppercase font-semibold">Batch Offset</div>
+                    <div className="grid grid-cols-3 gap-1">
+                        <div />
+                        <button onClick={() => updateFrameOffset('y', -1)} className="p-1 bg-zinc-700 hover:bg-zinc-600 rounded text-xs">Up</button>
+                        <div />
+                        <button onClick={() => updateFrameOffset('x', -1)} className="p-1 bg-zinc-700 hover:bg-zinc-600 rounded text-xs">Left</button>
+                        <div className="flex items-center justify-center text-zinc-500 text-xs"><Move className="w-3 h-3"/></div>
+                        <button onClick={() => updateFrameOffset('x', 1)} className="p-1 bg-zinc-700 hover:bg-zinc-600 rounded text-xs">Right</button>
+                        <div />
+                        <button onClick={() => updateFrameOffset('y', 1)} className="p-1 bg-zinc-700 hover:bg-zinc-600 rounded text-xs">Down</button>
+                        <div />
+                    </div>
+                </div>
             </div>
         )}
+
       </aside>
 
-      {/* Main Workspace */}
-      <main className="flex-1 flex flex-col h-full bg-zinc-950 relative">
+      {/* MAIN CONTENT AREA */}
+      <main className="flex-1 flex flex-col min-w-0">
           
-          {/* Toolbar */}
-          <div className="h-16 border-b border-zinc-800 flex items-center justify-between px-6 bg-zinc-900/30">
-             <div className="flex items-center gap-4">
-                 {/* Empty for now, could put zoom controls here */}
-             </div>
-             
-             {/* Playback Controls */}
-             <div className="flex items-center gap-4 bg-zinc-900 rounded-full px-4 py-2 border border-zinc-800">
-                 <button 
-                    onClick={() => setIsPlaying(!isPlaying)}
-                    className="w-8 h-8 rounded-full bg-zinc-800 hover:bg-zinc-700 flex items-center justify-center text-zinc-200 transition-colors"
-                 >
-                     {isPlaying ? <Pause size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" className="ml-0.5" />}
-                 </button>
-                 <div className="flex items-center gap-2 border-l border-zinc-700 pl-4">
-                     <span className="text-xs font-mono text-zinc-400 w-12">FPS {fps}</span>
-                     <input 
-                        type="range" 
-                        min="1" max="24" 
-                        value={fps} 
-                        onChange={(e) => setFps(parseInt(e.target.value))}
-                        className="w-24 h-1 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-pink-500"
-                     />
-                 </div>
-             </div>
+          {/* Top Bar - Preview & Export */}
+          <header className="h-16 border-b border-zinc-800 bg-zinc-900/30 flex items-center justify-between px-6">
+               <div className="flex items-center gap-4">
+                  {/* Animation Preview Small */}
+                  <div className="relative w-12 h-12 bg-zinc-800 rounded overflow-hidden border border-zinc-700">
+                     <canvas ref={previewCanvasRef} className="w-full h-full object-contain" />
+                     {activeFrames.length === 0 && <div className="absolute inset-0 flex items-center justify-center text-zinc-600"><EyeOff className="w-4 h-4"/></div>}
+                  </div>
+                  <div className="flex items-center gap-2 bg-zinc-800 rounded-lg p-1">
+                      <button onClick={() => setIsPlaying(!isPlaying)} className="p-1.5 hover:bg-zinc-700 rounded text-white">
+                          {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                      </button>
+                      <div className="h-4 w-px bg-zinc-700" />
+                      <div className="flex items-center gap-1 px-1">
+                         <span className="text-xs text-zinc-400">FPS</span>
+                         <input 
+                            type="number" 
+                            className="w-10 bg-transparent text-xs text-center focus:outline-none"
+                            value={fps}
+                            onChange={(e) => setFps(parseInt(e.target.value) || 8)}
+                         />
+                      </div>
+                  </div>
+               </div>
 
-             <button 
-                onClick={handleDownloadGif}
-                disabled={!sourceImage}
-                className="flex items-center gap-2 bg-zinc-100 hover:bg-white text-zinc-900 px-4 py-2 rounded-md text-sm font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-             >
-                 <Download size={16} /> Export GIF
-             </button>
-          </div>
+               <button 
+                onClick={handleExportGif}
+                disabled={isExporting || !sourceImage || activeFrames.length === 0}
+                className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+               >
+                 {isExporting ? <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"/> : <Download className="w-4 h-4" />}
+                 Export GIF
+               </button>
+          </header>
 
           {/* Canvas Area */}
-          <div className="flex-1 overflow-hidden relative flex">
-              
-              {/* Editor View */}
-              <div 
-                ref={containerRef} 
-                className="flex-1 overflow-auto flex items-center justify-center bg-zinc-950 p-8"
-              >
-                  {sourceImage ? (
-                      <div className="relative shadow-2xl shadow-black/50">
-                          <canvas 
-                            ref={canvasRef} 
-                            onClick={handleCanvasClick}
-                            className="cursor-crosshair max-w-[calc(100vw-450px)] max-h-[calc(100vh-200px)] object-contain border border-zinc-800"
-                            style={{ imageRendering: 'pixelated' }}
-                          />
-                      </div>
-                  ) : (
-                      <div className="text-zinc-600 flex flex-col items-center">
-                          <Sliders size={48} className="mb-4 opacity-20" />
-                          <p>Upload a sprite sheet or generate one to begin</p>
-                      </div>
-                  )}
-              </div>
-
-              {/* Live Preview Panel (Floating or fixed on right) */}
-              <div className="w-64 border-l border-zinc-800 bg-zinc-900/50 backdrop-blur flex flex-col">
-                  <div className="p-4 border-b border-zinc-800">
-                      <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-4">Live Preview</h3>
-                      <div className="aspect-square bg-[url('https://www.transparenttextures.com/patterns/black-linen.png')] bg-zinc-800 rounded-lg flex items-center justify-center overflow-hidden border border-zinc-700 shadow-inner">
-                          {sourceImage && (
-                              <canvas 
-                                ref={previewCanvasRef} 
-                                className="max-w-full max-h-full object-contain"
-                                style={{ imageRendering: 'pixelated' }}
-                              />
-                          )}
-                          {!sourceImage && <div className="text-zinc-600 text-xs">No Signal</div>}
-                      </div>
-                      <div className="mt-2 flex justify-between text-xs text-zinc-500 font-mono">
-                          <span>Frame: {previewFrameIndex + 1}/{frames.length}</span>
-                          {selectedFrameId !== null && isPlaying === false && (
-                              <span className="text-yellow-500">Editing Frame {selectedFrameId + 1}</span>
-                          )}
-                      </div>
-                  </div>
-                  
-                  {/* Instructions */}
-                  <div className="p-4 text-xs text-zinc-500 space-y-2">
-                      <p>1. <strong>Grid:</strong> Adjust rows/cols to match sprite sheet.</p>
-                      <p>2. <strong>Select:</strong> Click a frame in the main view.</p>
-                      <p>3. <strong>Adjust:</strong> Use arrow keys to fix jitter.</p>
-                      <p>4. <strong>Export:</strong> Download smooth GIF.</p>
-                  </div>
-
-                  {generationSuccess && (
-                      <div className="mt-auto p-4 bg-green-900/20 border-t border-green-900/50 text-green-400 text-xs">
-                          <p>Sprite generated successfully! The system has auto-guessed a 3x3 grid. Adjust if necessary.</p>
-                      </div>
-                  )}
-              </div>
+          <div className="flex-1 overflow-auto bg-[radial-gradient(#1f2937_1px,transparent_1px)] [background-size:16px_16px] p-8 flex items-center justify-center relative">
+             {sourceImage ? (
+                <div 
+                    ref={containerRef}
+                    className="relative shadow-2xl ring-1 ring-zinc-800 select-none"
+                    style={{ cursor: getCursor() }}
+                >
+                    <canvas 
+                        ref={canvasRef}
+                        onMouseDown={handleMouseDown}
+                        onMouseMove={handleMouseMove}
+                        onMouseUp={handleMouseUp}
+                        onMouseLeave={handleMouseLeave}
+                        className="max-w-full max-h-[80vh] object-contain block"
+                    />
+                    {/* Empty State Overlay if needed */}
+                </div>
+             ) : (
+                <div className="text-center text-zinc-500">
+                    <Grid className="w-12 h-12 mx-auto mb-3 opacity-20" />
+                    <p>Select an image or generate one to start slicing</p>
+                </div>
+             )}
           </div>
+
       </main>
     </div>
   );
-}
+};
 
 export default App;
