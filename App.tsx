@@ -200,60 +200,54 @@ const App: React.FC = () => {
 
   // --- Export ---
   const handleExportGif = () => {
-      if (!activeFrames.length || !imgRef.current.complete) return;
-      setIsExporting(true);
+    console.log('activeFrames', activeFrames)
+      // 边界判断
+    if (activeFrames.length === 0 || !imgRef.current?.complete) {
+      alert('无有效帧或图片资源未加载完成，无法导出！');
+      return;
+    }
 
-      // Determine dimensions based on the first active frame (assuming rough uniformity)
-      // or calculate max width/height if grid is irregular
-      const maxWidth = Math.max(...activeFrames.map(f => f.width));
-      const maxHeight = Math.max(...activeFrames.map(f => f.height));
+    // 创建临时 Canvas 用于绘制单帧
+    const tempCanvas = document.createElement('canvas');
+    const tempCtx = tempCanvas.getContext('2d');
+    if (!tempCtx) {
+      alert('获取 Canvas 上下文失败！');
+      return;
+    }
 
-      const gif = new window.GIF({
-          workers: 2,
-          quality: 10,
-          width: maxWidth, 
-          height: maxHeight,
-          workerScript: getGifWorkerUrl(),
-          transparent: 0x000000, 
-      });
+    // 遍历每帧，逐个导出
+    activeFrames.forEach((frame, index) => {
+      // 设置临时 Canvas 尺寸为当前帧尺寸
+      tempCanvas.width = frame.width;
+      tempCanvas.height = frame.height;
 
-      // Create a temporary canvas to draw each frame with its offset
-      const tempCanvas = document.createElement('canvas');
-      const ctx = tempCanvas.getContext('2d');
+      // 绘制当前帧（与预览逻辑一致）
+      tempCtx.clearRect(0, 0, frame.width, frame.height);
+      tempCtx.drawImage(
+        imgRef.current,
+        frame.x,
+        frame.y,
+        frame.width,
+        frame.height,
+        frame.offsetX,
+        frame.offsetY,
+        frame.width,
+        frame.height
+      );
 
-      activeFrames.forEach(frame => {
-          tempCanvas.width = maxWidth;
-          tempCanvas.height = maxHeight;
-          
-          if (ctx) {
-            ctx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
-            // Center alignment strategy: Draw frame relative to the "standard" box size
-            // but for now, we simply use the frame's own top-left as 0,0 relative to its cut
-            
-            // Note: If frame.width < maxWidth, we might want to center it.
-            // For simple sprite sheets, usually all cells are same size.
-            // We apply the User's manual Offset here.
-            
-            ctx.drawImage(
-                imgRef.current, 
-                frame.x, frame.y, frame.width, frame.height, 
-                frame.offsetX, frame.offsetY, frame.width, frame.height
-            );
-            gif.addFrame(ctx, {copy: true, delay: 1000 / fps});
-          }
-      });
+      // 生成下载链接
+      const url = tempCanvas.toDataURL('image/png'); // 导出为 PNG 格式（也可换 image/jpeg）
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `frame-${frame.id || index}.png`; // 文件名：frame-0.png、frame-1.png...
+      a.click();
 
-      gif.on('finished', (blob: Blob) => {
-          const url = URL.createObjectURL(blob);
-          const link = document.createElement('a');
-          link.href = url;
-          link.download = 'sprite-animation.gif';
-          link.click();
-          setIsExporting(false);
-      });
+      // 释放资源
+      URL.revokeObjectURL(url);
+    });
 
-      gif.render();
   };
+
 
 
   // --- Preview Loop ---
