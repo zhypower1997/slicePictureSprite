@@ -1,5 +1,6 @@
+
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Upload, Sliders, Play, Pause, Download, Wand2, Grid, MousePointer2, AlertCircle, RefreshCw, Move, Eye, EyeOff, CheckSquare, Square } from 'lucide-react';
+import { Upload, Play, Pause, Download, Wand2, Grid, AlertCircle, RefreshCw, Move, EyeOff, CheckSquare, Square, ChevronLeft, ChevronRight, Layers } from 'lucide-react';
 import { FrameConfig, GridDimensions, AppMode } from './types';
 import { generateSpriteSheet } from './services/geminiService';
 import { getGifWorkerUrl } from './utils/gifWorker';
@@ -31,7 +32,6 @@ const App: React.FC = () => {
   const [dividers, setDividers] = useState<Dividers>({ v: [0.33, 0.66], h: [0.33, 0.66] });
   
   const [frames, setFrames] = useState<FrameConfig[]>([]);
-  // Changed to array for multiple selection
   const [selectedFrameIds, setSelectedFrameIds] = useState<number[]>([]); 
   
   const [fps, setFps] = useState<number>(8);
@@ -58,8 +58,12 @@ const App: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Derived State
-  // Sort by ID to ensure GIF plays in grid order
-  const activeFrames = useMemo(() => frames.filter(f => f.active).sort((a,b) => a.id - b.id), [frames]);
+  // Sort by sequenceOrder to allow custom ordering
+  const activeFrames = useMemo(() => {
+    return frames
+        .filter(f => f.active)
+        .sort((a,b) => a.sequenceOrder - b.sequenceOrder);
+  }, [frames]);
 
   // --- Initialization & Grid Logic ---
 
@@ -104,8 +108,8 @@ const App: React.FC = () => {
                 const width = xPoints[c+1] - x;
                 const height = yPoints[r+1] - y;
                 
-                // Try to find existing frame to preserve offsets and active state
-                // We map loosely based on row/col index to keep state persistence during resize
+                // Try to find existing frame to preserve offsets, active state, and sequence
+                // We map loosely based on spatial proximity or row/col index
                 const existing = prev.find(p => p.row === r && p.col === c);
                 
                 newFrames.push({
@@ -119,6 +123,7 @@ const App: React.FC = () => {
                     offsetX: existing ? existing.offsetX : 0,
                     offsetY: existing ? existing.offsetY : 0,
                     active: existing ? existing.active : true,
+                    sequenceOrder: existing ? existing.sequenceOrder : idCounter,
                 });
                 idCounter++;
             }
@@ -161,6 +166,36 @@ const App: React.FC = () => {
       }));
   };
 
+  // --- Sequence Reordering ---
+
+  const moveFrameInSequence = (direction: -1 | 1) => {
+      if (selectedFrameIds.length !== 1) return; // Only allow single frame reorder for simplicity
+      const selectedId = selectedFrameIds[0];
+      const frame = frames.find(f => f.id === selectedId);
+      if (!frame || !frame.active) return;
+
+      // Get list of active frames sorted by current sequence
+      const sortedActive = [...frames.filter(f => f.active)].sort((a,b) => a.sequenceOrder - b.sequenceOrder);
+      const currentIndex = sortedActive.findIndex(f => f.id === selectedId);
+      
+      if (currentIndex === -1) return;
+      
+      const swapIndex = currentIndex + direction;
+      if (swapIndex < 0 || swapIndex >= sortedActive.length) return;
+
+      const targetFrame = sortedActive[swapIndex];
+
+      // Swap their sequenceOrder values
+      const newOrderA = targetFrame.sequenceOrder;
+      const newOrderB = frame.sequenceOrder;
+
+      setFrames(prev => prev.map(f => {
+          if (f.id === frame.id) return { ...f, sequenceOrder: newOrderA };
+          if (f.id === targetFrame.id) return { ...f, sequenceOrder: newOrderB };
+          return f;
+      }));
+  };
+
   // --- File & GenAI ---
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -186,7 +221,6 @@ const App: React.FC = () => {
     try {
       const base64Image = await generateSpriteSheet(prompt);
       setSourceImage(base64Image);
-      // Auto-guess grid for nano banana (3x3 is common)
       setGrid({ rows: 3, cols: 3 }); 
       resetDividers(3, 3);
       setMode(AppMode.EDIT);
@@ -199,24 +233,86 @@ const App: React.FC = () => {
   };
 
   // --- Export ---
-  const handleExportGif = () => {
-    console.log('activeFrames', activeFrames)
-      // 边界判断
+  const handleExportGif = async () => {
     if (activeFrames.length === 0 || !imgRef.current?.complete) {
-      alert('无有效帧或图片资源未加载完成，无法导出！');
+      alert('No active frames to export!');
       return;
     }
 
-    // 创建临时 Canvas 用于绘制单帧
-    const tempCanvas = document.createElement('canvas');
-    const tempCtx = tempCanvas.getContext('2d');
-    if (!tempCtx) {
-      alert('获取 Canvas 上下文失败！');
-      return;
-    }
+    setIsExporting(true);
 
-    // 遍历每帧，逐个导出
-    activeFrames.forEach((frame, index) => {
+    try {
+        const workerUrl = await getGifWorkerUrl();
+
+        const gif = new window.GIF({
+            workers: 2,
+            quality: 10,
+            width: activeFrames[0].width, // Assume roughly equal sizes, or use max
+            height: activeFrames[0].height,
+            workerScript: workerUrl
+        });
+
+        const tempCanvas = document.createElement('canvas');
+        const tempCtx = tempCanvas.getContext('2d');
+        if (!tempCtx) throw new Error('Could not create canvas context');
+
+        // Render each frame to the GIF
+        activeFrames.forEach((frame) => {
+            // Resize temp canvas to match frame size (GIF.js handles varying sizes, 
+            // but ideally frames should be uniform for a good sprite animation)
+            tempCanvas.width = frame.width;
+            tempCanvas.height = frame.height;
+
+            tempCtx.clearRect(0, 0, frame.width, frame.height);
+            tempCtx.drawImage(
+                imgRef.current,
+                frame.x, frame.y, frame.width, frame.height,
+                frame.offsetX, frame.offsetY, frame.width, frame.height
+            );
+            
+            gif.addFrame(tempCanvas, { delay: 1000 / fps, copy: true });
+        });
+
+        gif.on('finished', (blob: Blob) => {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `animation-${Date.now()}.gif`;
+            a.click();
+            URL.revokeObjectURL(url);
+            URL.revokeObjectURL(workerUrl); // Clean up worker URL
+            setIsExporting(false);
+        });
+
+        gif.render();
+
+    } catch (e) {
+        console.error(e);
+        alert('Failed to export GIF. See console for details.');
+        setIsExporting(false);
+    }
+  };
+  
+  const handleExportPic = () => {
+  console.log('activeFrames', activeFrames);
+  // 边界判断
+  if (activeFrames.length === 0 || !imgRef.current?.complete) {
+    alert('无有效帧或图片资源未加载完成，无法导出！');
+    return;
+  }
+
+  // 创建临时 Canvas 用于绘制单帧
+  const tempCanvas = document.createElement('canvas');
+  const tempCtx = tempCanvas.getContext('2d');
+  if (!tempCtx) {
+    alert('获取 Canvas 上下文失败！');
+    return;
+  }
+
+  // 遍历每帧，逐个导出（添加延迟）
+  activeFrames.forEach((frame, index) => {
+    // 为每个帧添加延迟，避免浏览器拦截（100ms 可根据实际情况调整）
+    setTimeout(() => {
       // 设置临时 Canvas 尺寸为当前帧尺寸
       tempCanvas.width = frame.width;
       tempCanvas.height = frame.height;
@@ -240,21 +336,22 @@ const App: React.FC = () => {
       const a = document.createElement('a');
       a.href = url;
       a.download = `frame-${frame.id || index}.png`; // 文件名：frame-0.png、frame-1.png...
+      // 必须将 a 标签添加到文档中，部分浏览器需要此步骤
+      document.body.appendChild(a);
       a.click();
+      // 移除 a 标签
+      document.body.removeChild(a);
 
       // 释放资源
       URL.revokeObjectURL(url);
-    });
-
-  };
-
-
+    }, index * 100); // 每个帧延迟 index*100ms，依次导出
+  });
+};
 
   // --- Preview Loop ---
   useEffect(() => {
     if (!isPlaying || activeFrames.length === 0) return;
 
-    // Reset index if out of bounds (e.g. frames disabled)
     if (previewFrameIndex >= activeFrames.length) {
         setPreviewFrameIndex(0);
     }
@@ -264,11 +361,10 @@ const App: React.FC = () => {
     }, 1000 / fps);
 
     return () => clearInterval(interval);
-  }, [isPlaying, fps, activeFrames.length]); // Depend on activeFrames length
+  }, [isPlaying, fps, activeFrames.length]);
 
   // --- Canvas Rendering ---
   
-  // Helper to get mouse pos relative to image logic
   const getRelativeMousePos = (e: React.MouseEvent) => {
       const canvas = canvasRef.current;
       if (!canvas) return { x: 0, y: 0 };
@@ -281,7 +377,6 @@ const App: React.FC = () => {
       };
   };
 
-  // Helper to normalize selection box
   const getSelectionRect = (box: SelectionBox) => {
       const x = Math.min(box.startX, box.currentX);
       const y = Math.min(box.startY, box.currentY);
@@ -306,7 +401,6 @@ const App: React.FC = () => {
 
     const img = imgRef.current;
     
-    // Ensure canvas matches image resolution
     if (canvas.width !== img.width || canvas.height !== img.height) {
         canvas.width = img.width;
         canvas.height = img.height;
@@ -317,26 +411,39 @@ const App: React.FC = () => {
     ctx.drawImage(img, 0, 0);
 
     // 2. Draw Frame Overlays
+    // Pre-calculate sequence index for active frames to display badge
+    const activeFrameMap = new Map<number, number>();
+    activeFrames.forEach((f, idx) => activeFrameMap.set(f.id, idx + 1));
+
     frames.forEach(frame => {
         // Handle Inactive Frames
         if (!frame.active) {
-            ctx.fillStyle = 'rgba(0, 0, 0, 0.65)'; // Dark overlay
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.65)'; 
             ctx.fillRect(frame.x, frame.y, frame.width, frame.height);
             
-            // Draw 'X'
             ctx.beginPath();
             ctx.moveTo(frame.x, frame.y);
             ctx.lineTo(frame.x + frame.width, frame.y + frame.height);
             ctx.moveTo(frame.x + frame.width, frame.y);
             ctx.lineTo(frame.x, frame.y + frame.height);
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
             ctx.lineWidth = 1;
             ctx.stroke();
+        } else {
+             // Draw Sequence Badge
+             const seqNum = activeFrameMap.get(frame.id);
+             if (seqNum !== undefined) {
+                 ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+                 ctx.fillRect(frame.x + 2, frame.y + 2, 20, 20);
+                 ctx.fillStyle = '#fff';
+                 ctx.font = '12px sans-serif';
+                 ctx.fillText(seqNum.toString(), frame.x + 8, frame.y + 16);
+             }
         }
 
         // Highlight selected frames
         if (selectedFrameIds.includes(frame.id)) {
-            ctx.fillStyle = 'rgba(59, 130, 246, 0.2)'; // Blue tint
+            ctx.fillStyle = 'rgba(59, 130, 246, 0.2)';
             ctx.fillRect(frame.x, frame.y, frame.width, frame.height);
             ctx.strokeStyle = '#3b82f6';
             ctx.lineWidth = 2;
@@ -353,8 +460,7 @@ const App: React.FC = () => {
         }
     });
 
-    // 3. Draw Draggable Grid Lines
-    // Vertical
+    // 3. Draw Grid Lines
     dividers.v.forEach((pos, idx) => {
         const x = pos * canvas.width;
         const isHovered = hoverTarget?.type === 'v' && hoverTarget.index === idx;
@@ -368,7 +474,6 @@ const App: React.FC = () => {
         ctx.stroke();
     });
 
-    // Horizontal
     dividers.h.forEach((pos, idx) => {
         const y = pos * canvas.height;
         const isHovered = hoverTarget?.type === 'h' && hoverTarget.index === idx;
@@ -395,7 +500,7 @@ const App: React.FC = () => {
 
   useEffect(() => {
      requestAnimationFrame(drawEditor);
-  }, [sourceImage, frames, dividers, hoverTarget, dragTarget, selectedFrameIds, selectionBox]);
+  }, [sourceImage, frames, dividers, hoverTarget, dragTarget, selectedFrameIds, selectionBox, activeFrames]);
 
 
   // --- Canvas Interaction ---
@@ -403,13 +508,11 @@ const App: React.FC = () => {
   const handleMouseDown = (e: React.MouseEvent) => {
       const { x, y } = getRelativeMousePos(e);
 
-      // 1. Grid Line Priority
       if (hoverTarget) {
           setDragTarget(hoverTarget);
           return;
       }
 
-      // 2. Start Selection Box
       setIsSelecting(true);
       setSelectionBox({
           startX: x,
@@ -417,10 +520,6 @@ const App: React.FC = () => {
           currentX: x,
           currentY: y
       });
-      
-      // Clear selection unless holding Shift (can add shift logic later, keep simple for now)
-      // Actually, standard behavior: Click clears, Drag creates new selection. 
-      // We will handle "click vs drag" logic in MouseUp.
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
@@ -429,25 +528,19 @@ const App: React.FC = () => {
       if (!canvas) return;
 
       if (dragTarget) {
-          // DRAGGING GRID LINE
           if (dragTarget.type === 'v') {
               const prevLimit = dragTarget.index === 0 ? 0 : dividers.v[dragTarget.index - 1];
               const nextLimit = dragTarget.index === dividers.v.length - 1 ? 1 : dividers.v[dragTarget.index + 1];
-              
-              // Clamp to normalized coordinates
               let newPos = x / canvas.width;
               newPos = Math.max(prevLimit + 0.01, Math.min(nextLimit - 0.01, newPos));
-              
               const newV = [...dividers.v];
               newV[dragTarget.index] = newPos;
               setDividers({ ...dividers, v: newV });
           } else {
               const prevLimit = dragTarget.index === 0 ? 0 : dividers.h[dragTarget.index - 1];
               const nextLimit = dragTarget.index === dividers.h.length - 1 ? 1 : dividers.h[dragTarget.index + 1];
-              
               let newPos = y / canvas.height;
               newPos = Math.max(prevLimit + 0.01, Math.min(nextLimit - 0.01, newPos));
-              
               const newH = [...dividers.h];
               newH[dragTarget.index] = newPos;
               setDividers({ ...dividers, h: newH });
@@ -456,15 +549,11 @@ const App: React.FC = () => {
       }
 
       if (isSelecting && selectionBox) {
-          // DRAGGING SELECTION BOX
           setSelectionBox(prev => prev ? ({ ...prev, currentX: x, currentY: y }) : null);
           return;
       }
 
-      // HOVER DETECTION FOR GRID
       let found: { type: 'v' | 'h', index: number } | null = null;
-      
-      // Check Vertical Lines
       for (let i = 0; i < dividers.v.length; i++) {
           const lineX = dividers.v[i] * canvas.width;
           if (Math.abs(x - lineX) < HIT_TOLERANCE) {
@@ -472,8 +561,6 @@ const App: React.FC = () => {
               break;
           }
       }
-
-      // Check Horizontal Lines (prioritize if not found vertical)
       if (!found) {
           for (let i = 0; i < dividers.h.length; i++) {
               const lineY = dividers.h[i] * canvas.height;
@@ -483,24 +570,20 @@ const App: React.FC = () => {
               }
           }
       }
-
       setHoverTarget(found);
   };
 
   const handleMouseUp = (e: React.MouseEvent) => {
-      // End Drag
       if (dragTarget) {
           setDragTarget(null);
           return;
       }
 
-      // End Selection
       if (isSelecting && selectionBox) {
           const { x, y } = getRelativeMousePos(e);
           const dist = Math.sqrt(Math.pow(x - selectionBox.startX, 2) + Math.pow(y - selectionBox.startY, 2));
 
           if (dist < 5) {
-              // CLICK: Select single frame
               const clickedFrame = frames.find(f => 
                 x >= f.x && x < f.x + f.width && 
                 y >= f.y && y < f.y + f.height
@@ -511,7 +594,6 @@ const App: React.FC = () => {
                   setSelectedFrameIds([]);
               }
           } else {
-              // DRAG: Box select
               const selRect = getSelectionRect(selectionBox);
               const intersected = frames.filter(f => isIntersecting(selRect, f));
               setSelectedFrameIds(intersected.map(f => f.id));
@@ -529,7 +611,6 @@ const App: React.FC = () => {
       setIsSelecting(false);
   };
 
-  // Cursor style
   const getCursor = () => {
       if (dragTarget) return dragTarget.type === 'v' ? 'col-resize' : 'row-resize';
       if (hoverTarget) return hoverTarget.type === 'v' ? 'col-resize' : 'row-resize';
@@ -543,7 +624,6 @@ const App: React.FC = () => {
       const ctx = previewCanvasRef.current.getContext('2d');
       if (!ctx) return;
 
-      // Handle case with no active frames
       if (activeFrames.length === 0) {
           ctx.clearRect(0, 0, previewCanvasRef.current.width, previewCanvasRef.current.height);
           ctx.fillStyle = '#18181b';
@@ -555,7 +635,6 @@ const App: React.FC = () => {
       const frame = activeFrames[safeIndex];
       
       if (imgRef.current.complete && frame) {
-          // Set canvas size to frame size
           previewCanvasRef.current.width = frame.width;
           previewCanvasRef.current.height = frame.height;
 
@@ -566,9 +645,7 @@ const App: React.FC = () => {
               frame.offsetX, frame.offsetY, frame.width, frame.height
           );
       }
-
-  }, [previewFrameIndex, activeFrames]); // Redraw when index or geometry changes
-
+  }, [previewFrameIndex, activeFrames]);
 
   return (
     <div className="flex h-screen w-full bg-zinc-950 text-zinc-200 font-sans overflow-hidden">
@@ -590,7 +667,7 @@ const App: React.FC = () => {
           <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Generate New</label>
           <textarea 
             className="w-full bg-zinc-950 border border-zinc-700 rounded p-3 text-sm focus:border-indigo-500 focus:outline-none resize-none h-24"
-            placeholder="Describe your character (e.g., 'a small knight running animation')"
+            placeholder="Describe your character..."
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
           />
@@ -659,9 +736,6 @@ const App: React.FC = () => {
                     />
                 </div>
             </div>
-            <p className="text-[10px] text-zinc-500 italic">
-                Tip: Drag grid lines to adjust. Drag empty space to box-select.
-            </p>
         </div>
 
         {/* Selected Frames Adjustment */}
@@ -689,8 +763,9 @@ const App: React.FC = () => {
                     </button>
                 </div>
 
+                {/* Fine Tune Offset */}
                 <div className="space-y-2">
-                    <div className="text-[10px] text-zinc-500 uppercase font-semibold">Batch Offset</div>
+                    <div className="text-[10px] text-zinc-500 uppercase font-semibold">Fine Tune Offset</div>
                     <div className="grid grid-cols-3 gap-1">
                         <div />
                         <button onClick={() => updateFrameOffset('y', -1)} className="p-1 bg-zinc-700 hover:bg-zinc-600 rounded text-xs">Up</button>
@@ -703,6 +778,29 @@ const App: React.FC = () => {
                         <div />
                     </div>
                 </div>
+
+                {/* Sequence Ordering */}
+                {selectedFrameIds.length === 1 && frames.find(f => f.id === selectedFrameIds[0])?.active && (
+                    <div className="space-y-2 pt-2 border-t border-zinc-700/50">
+                        <div className="text-[10px] text-zinc-500 uppercase font-semibold flex items-center gap-1">
+                            <Layers className="w-3 h-3"/> Reorder Sequence
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                            <button 
+                                onClick={() => moveFrameInSequence(-1)}
+                                className="flex items-center justify-center gap-1 bg-zinc-700 hover:bg-zinc-600 rounded py-1.5 text-xs"
+                            >
+                                <ChevronLeft className="w-3 h-3" /> Earlier
+                            </button>
+                            <button 
+                                onClick={() => moveFrameInSequence(1)}
+                                className="flex items-center justify-center gap-1 bg-zinc-700 hover:bg-zinc-600 rounded py-1.5 text-xs"
+                            >
+                                Later <ChevronRight className="w-3 h-3" />
+                            </button>
+                        </div>
+                    </div>
+                )}
             </div>
         )}
 
@@ -744,6 +842,15 @@ const App: React.FC = () => {
                  {isExporting ? <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"/> : <Download className="w-4 h-4" />}
                  Export GIF
                </button>
+
+               <button 
+                onClick={handleExportPic}
+                disabled={isExporting || !sourceImage || activeFrames.length === 0}
+                className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+               >
+                 {isExporting ? <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"/> : <Download className="w-4 h-4" />}
+                 Export Pic
+               </button>
           </header>
 
           {/* Canvas Area */}
@@ -762,7 +869,6 @@ const App: React.FC = () => {
                         onMouseLeave={handleMouseLeave}
                         className="max-w-full max-h-[80vh] object-contain block"
                     />
-                    {/* Empty State Overlay if needed */}
                 </div>
              ) : (
                 <div className="text-center text-zinc-500">

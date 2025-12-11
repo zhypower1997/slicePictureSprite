@@ -1,3 +1,4 @@
+
 export interface FrameConfig {
   id: number;
   row: number;
@@ -9,6 +10,7 @@ export interface FrameConfig {
   offsetX: number;
   offsetY: number;
   active: boolean;
+  sequenceOrder: number; // For custom sorting of animation frames
 }
 
 export interface GridDimensions {
