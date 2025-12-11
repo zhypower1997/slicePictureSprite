@@ -1,6 +1,6 @@
 
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Upload, Play, Pause, Download, Wand2, Grid, AlertCircle, RefreshCw, Move, EyeOff, CheckSquare, Square, ChevronLeft, ChevronRight, Layers } from 'lucide-react';
+import { Upload, Play, Pause, Download, Wand2, Grid, AlertCircle, RefreshCw, Move, EyeOff, CheckSquare, Square, ChevronLeft, ChevronRight, Layers, FlipHorizontal } from 'lucide-react';
 import { FrameConfig, GridDimensions, AppMode } from './types';
 import { generateSpriteSheet } from './services/geminiService';
 import { getGifWorkerUrl } from './utils/gifWorker';
@@ -123,6 +123,7 @@ const App: React.FC = () => {
                     offsetX: existing ? existing.offsetX : 0,
                     offsetY: existing ? existing.offsetY : 0,
                     active: existing ? existing.active : true,
+                    flipH: existing ? existing.flipH : false,
                     sequenceOrder: existing ? existing.sequenceOrder : idCounter,
                 });
                 idCounter++;
@@ -151,6 +152,16 @@ const App: React.FC = () => {
                   ...f, 
                   [axis === 'x' ? 'offsetX' : 'offsetY']: (axis === 'x' ? f.offsetX : f.offsetY) + delta 
               };
+          }
+          return f;
+      }));
+  };
+
+  const toggleFrameFlip = () => {
+      if (selectedFrameIds.length === 0) return;
+      setFrames(prev => prev.map(f => {
+          if (selectedFrameIds.includes(f.id)) {
+              return { ...f, flipH: !f.flipH };
           }
           return f;
       }));
@@ -264,11 +275,23 @@ const App: React.FC = () => {
             tempCanvas.height = frame.height;
 
             tempCtx.clearRect(0, 0, frame.width, frame.height);
+            
+            tempCtx.save();
+            if (frame.flipH) {
+                // Flip coordinate system horizontally around the center or start?
+                // Scale -1, 1 flips around x=0. So we need to translate first.
+                // Move to right edge, then flip
+                tempCtx.translate(frame.width, 0);
+                tempCtx.scale(-1, 1);
+            }
+
             tempCtx.drawImage(
                 imgRef.current,
                 frame.x, frame.y, frame.width, frame.height,
                 frame.offsetX, frame.offsetY, frame.width, frame.height
             );
+            
+            tempCtx.restore();
             
             gif.addFrame(tempCanvas, { delay: 1000 / fps, copy: true });
         });
@@ -294,31 +317,32 @@ const App: React.FC = () => {
   };
   
   const handleExportPic = () => {
-  console.log('activeFrames', activeFrames);
-  // 边界判断
   if (activeFrames.length === 0 || !imgRef.current?.complete) {
-    alert('无有效帧或图片资源未加载完成，无法导出！');
+    alert('No active frames or image not loaded!');
     return;
   }
 
-  // 创建临时 Canvas 用于绘制单帧
   const tempCanvas = document.createElement('canvas');
   const tempCtx = tempCanvas.getContext('2d');
   if (!tempCtx) {
-    alert('获取 Canvas 上下文失败！');
+    alert('Failed to create canvas context!');
     return;
   }
 
-  // 遍历每帧，逐个导出（添加延迟）
+  // Iterate activeFrames (which are already sorted by sequenceOrder)
   activeFrames.forEach((frame, index) => {
-    // 为每个帧添加延迟，避免浏览器拦截（100ms 可根据实际情况调整）
     setTimeout(() => {
-      // 设置临时 Canvas 尺寸为当前帧尺寸
       tempCanvas.width = frame.width;
       tempCanvas.height = frame.height;
 
-      // 绘制当前帧（与预览逻辑一致）
       tempCtx.clearRect(0, 0, frame.width, frame.height);
+      
+      tempCtx.save();
+      if (frame.flipH) {
+          tempCtx.translate(frame.width, 0);
+          tempCtx.scale(-1, 1);
+      }
+      
       tempCtx.drawImage(
         imgRef.current,
         frame.x,
@@ -330,21 +354,23 @@ const App: React.FC = () => {
         frame.width,
         frame.height
       );
+      
+      tempCtx.restore();
 
-      // 生成下载链接
-      const url = tempCanvas.toDataURL('image/png'); // 导出为 PNG 格式（也可换 image/jpeg）
+      const url = tempCanvas.toDataURL('image/png');
       const a = document.createElement('a');
       a.href = url;
-      a.download = `frame-${frame.id || index}.png`; // 文件名：frame-0.png、frame-1.png...
-      // 必须将 a 标签添加到文档中，部分浏览器需要此步骤
+      // USE INDEX FOR FILENAME TO PRESERVE ORDER
+      // Pad index with zeros (e.g., frame-001.png)
+      const paddedIndex = String(index).padStart(3, '0');
+      a.download = `frame-${paddedIndex}.png`; 
+      
       document.body.appendChild(a);
       a.click();
-      // 移除 a 标签
       document.body.removeChild(a);
 
-      // 释放资源
       URL.revokeObjectURL(url);
-    }, index * 100); // 每个帧延迟 index*100ms，依次导出
+    }, index * 100);
   });
 };
 
@@ -416,6 +442,24 @@ const App: React.FC = () => {
     activeFrames.forEach((f, idx) => activeFrameMap.set(f.id, idx + 1));
 
     frames.forEach(frame => {
+        // If flipped, render the flipped version on top so user sees the change
+        if (frame.flipH && frame.active) {
+            ctx.save();
+            // Optional: Clear underneath to prevent ghosting if transparent, 
+            // though clearing on top of source image shows canvas background.
+            // Usually simpler to just draw over for opaque sprites.
+            ctx.clearRect(frame.x, frame.y, frame.width, frame.height);
+            
+            // Transform for this specific frame rect
+            ctx.translate(frame.x + frame.width, frame.y);
+            ctx.scale(-1, 1);
+            
+            // Draw the source slice at (0,0) relative to translation
+            // Source is at frame.x, frame.y
+            ctx.drawImage(img, frame.x, frame.y, frame.width, frame.height, 0, 0, frame.width, frame.height);
+            ctx.restore();
+        }
+
         // Handle Inactive Frames
         if (!frame.active) {
             ctx.fillStyle = 'rgba(0, 0, 0, 0.65)'; 
@@ -639,11 +683,19 @@ const App: React.FC = () => {
           previewCanvasRef.current.height = frame.height;
 
           ctx.clearRect(0, 0, frame.width, frame.height);
+          
+          ctx.save();
+          if (frame.flipH) {
+             ctx.translate(frame.width, 0);
+             ctx.scale(-1, 1);
+          }
+
           ctx.drawImage(
               imgRef.current, 
               frame.x, frame.y, frame.width, frame.height, 
               frame.offsetX, frame.offsetY, frame.width, frame.height
           );
+          ctx.restore();
       }
   }, [previewFrameIndex, activeFrames]);
 
@@ -762,6 +814,13 @@ const App: React.FC = () => {
                         <Square className="w-3 h-3" /> Mark Skipped
                     </button>
                 </div>
+                
+                <button 
+                     onClick={toggleFrameFlip}
+                     className="w-full flex items-center justify-center gap-1 bg-zinc-700 hover:bg-zinc-600 rounded py-1.5 text-xs transition-colors"
+                >
+                    <FlipHorizontal className="w-3 h-3" /> Flip Horizontal
+                </button>
 
                 {/* Fine Tune Offset */}
                 <div className="space-y-2">
@@ -834,23 +893,25 @@ const App: React.FC = () => {
                   </div>
                </div>
 
-               <button 
-                onClick={handleExportGif}
-                disabled={isExporting || !sourceImage || activeFrames.length === 0}
-                className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-               >
-                 {isExporting ? <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"/> : <Download className="w-4 h-4" />}
-                 Export GIF
-               </button>
+               <div className="flex items-center gap-2">
+                   <button 
+                    onClick={handleExportGif}
+                    disabled={isExporting || !sourceImage || activeFrames.length === 0}
+                    className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                   >
+                     {isExporting ? <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"/> : <Download className="w-4 h-4" />}
+                     Export GIF
+                   </button>
 
-               <button 
-                onClick={handleExportPic}
-                disabled={isExporting || !sourceImage || activeFrames.length === 0}
-                className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-               >
-                 {isExporting ? <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"/> : <Download className="w-4 h-4" />}
-                 Export Pic
-               </button>
+                   <button 
+                    onClick={handleExportPic}
+                    disabled={isExporting || !sourceImage || activeFrames.length === 0}
+                    className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                   >
+                     {isExporting ? <div className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"/> : <Download className="w-4 h-4" />}
+                     Export Pic
+                   </button>
+               </div>
           </header>
 
           {/* Canvas Area */}

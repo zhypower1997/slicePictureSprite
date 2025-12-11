@@ -10,6 +10,7 @@ export interface FrameConfig {
   offsetX: number;
   offsetY: number;
   active: boolean;
+  flipH: boolean; // Horizontal flip state
   sequenceOrder: number; // For custom sorting of animation frames
 }
 
